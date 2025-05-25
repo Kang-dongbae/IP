@@ -1,145 +1,93 @@
-from gurobipy import Model, GRB, quicksum, LinExpr
-import random
+import gurobipy as gp
+from gurobipy import GRB
+import numpy as np
 
-# 재현성을 위해 시드 설정
-random.seed(42)
+# Set random seed for reproducibility
+np.random.seed(42)
 
-# 부품별 RUL 생성
-num_parts = 5  # 부품 수 (I 대신 명확한 이름 사용)
-rul_data = {i: random.weibullvariate(alpha=10.0, beta=2.0) for i in range(num_parts)}
+# Parameters
+n = 100  # Number of components
+T = 20  # Time horizon
+M = 1000  # Big-M constant for constraints
+K = 2   # Number of maintenance crews
 
-def predictive_maintenance_demand(t, i):
-    """
-    부품 i가 시간 t에서 교체가 필요한지 반환 (RUL 기반, 1: 교체 필요, 0: 불필요)
-    """
-    return 1 if abs(t - rul_data[i]) < 0.5 else 0
+# Component-specific parameters
+RUL = [np.random.randint(50, 100) for _ in range(n)]  # Predicted RUL for each component
+c_pm = [10 for _ in range(n)]  # Preventive maintenance cost
+c_cm = [50 for _ in range(n)]  # Corrective maintenance cost (higher due to failure)
+t_pm = [5 for _ in range(n)]   # Preventive maintenance time
+t_cm = [10 for _ in range(n)]  # Corrective maintenance time
 
-# 모델 매개변수
-T = 12  # 계획 기간
-C_h = 2.0  # 보관 비용
-C_s = 15.0  # 결품 비용
-C_m = 50.0  # 유지보수 비용
-M = 1000  # Big-M 상수
-I_0 = {i: 10 for i in range(num_parts)}  # 초기 재고
-D = {(t, i): predictive_maintenance_demand(t, i) for t in range(T) for i in range(num_parts)}  # RUL 기반 수요
+# Initialize Gurobi model
+model = gp.Model("PredictiveMaintenance")
 
-# 수요 데이터 출력 (디버깅용)
-print("RUL 데이터:", rul_data)
-print("수요 데이터:", D)
+# Decision variables
+x = model.addVars(n, T, vtype=GRB.BINARY, name="x")  # x[i,t]: maintenance of component i starts at time t
+y = model.addVars(n, vtype=GRB.BINARY, name="y")     # y[i]: 1 if component i fails (CM), 0 if PM
 
-# Gurobi 모델 생성
-model = Model("PdM_Inventory_Optimization")
+# Completion time variable (for total maintenance completion time)
+C_max = model.addVar(vtype=GRB.CONTINUOUS, name="C_max")
 
-# 결정 변수
-X = model.addVars(T, num_parts, vtype=GRB.INTEGER, name="order")  # 발주량
-Inv = model.addVars(T, num_parts, vtype=GRB.CONTINUOUS, name="inventory")  # 재고 수준 (I 대신 Inv 사용)
-S = model.addVars(T, num_parts, vtype=GRB.CONTINUOUS, name="shortage")  # 결품량
-M_var = model.addVars(T, num_parts, vtype=GRB.BINARY, name="maintenance")  # 유지보수 여부
-CT = model.addVar(vtype=GRB.CONTINUOUS, name="completion_time")  # 완료 시간
+# Objective 1: Minimize total maintenance cost
+cost = gp.quicksum(c_pm[i] * (1 - y[i]) + c_cm[i] * y[i] for i in range(n))
 
-# 목적 함수: 비용과 완료 시간의 가중 합
-cost_expr = LinExpr()
-for t in range(T):
-    for i in range(num_parts):
-        cost_expr += C_h * Inv[t, i] + C_s * S[t, i] + C_m * M_var[t, i]
-
-w1, w2 = 0.7, 0.3  # 가중치
-model.setObjective(w1 * cost_expr + w2 * CT, GRB.MINIMIZE)
-
-# 제약 조건
-# 1. 재고 흐름
-for t in range(T):
-    for i in range(num_parts):
-        if t == 0:
-            model.addConstr(Inv[t, i] == I_0[i] + X[t, i] - D[t, i] + S[t, i], name=f"InvBal_t{t}_i{i}")
-        else:
-            model.addConstr(Inv[t, i] == Inv[t-1, i] + X[t, i] - D[t, i] + S[t, i], name=f"InvBal_t{t}_i{i}")
-
-# 2. 유지보수 필요
-for t in range(T):
-    for i in range(num_parts):
-        model.addConstr(M_var[t, i] >= D[t, i] / M, name=f"MaintReq_t{t}_i{i}")
-
-# 3. 재고 및 결품 비음수
-for t in range(T):
-    for i in range(num_parts):
-        model.addConstr(Inv[t, i] >= 0, name=f"NonNegInv_t{t}_i{i}")
-        model.addConstr(S[t, i] >= 0, name=f"NonNegShort_t{t}_i{i}")
-
-# 4. 완료 시간
-for t in range(T):
-    for i in range(num_parts):
-        model.addConstr(CT >= t * M_var[t, i], name=f"CompTime_t{t}_i{i}")
-
-# 최적화
-model.optimize()
-
-# 결과 출력
-if model.status == GRB.OPTIMAL:
-    print("최적 해 발견")
-    print(f"총 목적 함수 값: {model.objVal:.2f}")
-    print(f"완료 시간: {CT.x:.2f}")
+# Objective 2: Minimize maximum completion time (C_max)
+# C_max is constrained to be greater than the completion time of each maintenance task
+for i in range(n):
     for t in range(T):
-        for i in range(num_parts):
-            print(f"시간 {t}, 부품 {i}: 발주량 {X[t, i].x:.2f}, 재고 {Inv[t, i].x:.2f}, 결품 {S[t, i].x:.2f}, 유지보수 {M_var[t, i].x:.2f}")
+        model.addConstr(C_max >= (t + t_pm[i] * (1 - y[i]) + t_cm[i] * y[i]) * x[i, t])
 
-    # 부품 0의 재고 및 발주량 시각화
-    inventory_data = [Inv[t, 0].x for t in range(T)]
-    order_data = [X[t, 0].x for t in range(T)]
-    labels = [f"시간 {t}" for t in range(T)]
-    print("""
-```chartjs
-{
-  "type": "line",
-  "data": {
-    "labels": %s,
-    "datasets": [
-      {
-        "label": "재고 수준 (부품 0)",
-        "data": %s,
-        "borderColor": "#1f77b4",
-        "backgroundColor": "rgba(31, 119, 180, 0.2)",
-        "fill": true
-      },
-      {
-        "label": "발주량 (부품 0)",
-        "data": %s,
-        "borderColor": "#ff7f0e",
-        "backgroundColor": "rgba(255, 127, 14, 0.2)",
-        "fill": true
-      }
-    ]
-  },
-  "options": {
-    "responsive": true,
-    "scales": {
-      "y": {
-        "beginAtZero": true,
-        "title": {
-          "display": true,
-          "text": "수량"
+# Constraints
+# 1. Each component is maintained exactly once
+for i in range(n):
+    model.addConstr(gp.quicksum(x[i, t] for t in range(T)) == 1, name=f"OneMaintenance_{i}")
+
+# 2. Failure condition: y[i] = 1 if maintenance starts after RUL
+for i in range(n):
+    for t in range(T):
+        if t > RUL[i]:
+            model.addConstr(x[i, t] <= y[i], name=f"Failure_{i}_{t}")
+
+# 3. Resource constraint: At most K crews can perform maintenance at any time
+for t in range(T):
+    model.addConstr(
+        gp.quicksum(x[i, t_prime] for i in range(n) for t_prime in range(max(0, t - t_cm[i] + 1), min(T, t + t_pm[i]))) <= K,
+        name=f"Resource_{t}"
+    )
+
+# ε-constraint method: Generate Pareto solutions by varying ε for completion time
+epsilon_values = [20, 40, 60, 80, 100]  # Possible bounds for C_max
+pareto_solutions = []
+
+for epsilon in epsilon_values:
+    # Reset model
+    model.reset()
+    
+    # Add ε-constraint for C_max
+    model.addConstr(C_max <= epsilon, name="Epsilon_Constraint")
+    
+    # Set objective to minimize cost
+    model.setObjective(cost, GRB.MINIMIZE)
+    
+    # Optimize
+    model.optimize()
+    
+    if model.status == GRB.OPTIMAL:
+        solution = {
+            'epsilon': epsilon,
+            'cost': model.objVal,
+            'C_max': C_max.X,
+            'maintenance_schedule': [(i, t, x[i, t].X, y[i].X) for i in range(n) for t in range(T) if x[i, t].X > 0.5]
         }
-      },
-      "x": {
-        "title": {
-          "display": true,
-          "text": "시간 구간"
-        }
-      }
-    },
-    "plugins": {
-      "title": {
-        "display": true,
-        "text": "부품 0의 시간별 재고 및 발주량"
-      }
-    }
-  }
-}
-```""" % (labels, inventory_data, order_data))
-else:
-    print("최적 해를 찾지 못했습니다")
-    print(f"모델 상태: {model.status}")
-    if model.status == GRB.INFEASIBLE:
-        model.computeIIS()
-        model.write("infeasible_constraints.ilp")
-        print("IIS 파일(infeasible_constraints.ilp)을 확인하여 충돌 제약 조건을 점검하세요.")
+        pareto_solutions.append(solution)
+
+# Print Pareto solutions
+print("\nPareto-Optimal Solutions:")
+for sol in pareto_solutions:
+    print(f"\nε = {sol['epsilon']}:")
+    print(f"  Total Cost: {sol['cost']}")
+    print(f"  Max Completion Time: {sol['C_max']}")
+    print("  Maintenance Schedule:")
+    for i, t, x_val, y_val in sol['maintenance_schedule']:
+        maintenance_type = "CM" if y_val > 0.5 else "PM"
+        print(f"    Component {i} at time {t}: {maintenance_type}")
